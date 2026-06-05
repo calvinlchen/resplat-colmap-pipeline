@@ -51,6 +51,31 @@ pip install --no-build-isolation git+https://github.com/nerfstudio-project/gspla
 cd src/model/encoder/pointops && python setup.py install && cd ../../../..
 ```
 
+### Windows CUDA Extension Build Notes
+
+`gsplat` and `pointops` compile native CUDA/C++ extensions. On Windows, build them from an x64 Visual Studio developer shell and make sure the CUDA Toolkit and compiler selected on `PATH` match the PyTorch CUDA build.
+
+For the default PyTorch wheel above (`torch==2.7.0+cu128`), CUDA Toolkit 12.8 is preferred. CUDA 12.5 may also build, but the compiler selection is important: use Visual Studio 2022 Build Tools, not a newer preview compiler. If `pip install ... gsplat...` fails with an error like `nvcc error : 'cudafe++' died` or `Error checking compiler version for cl`, check the active toolchain before retrying:
+
+```powershell
+where cl
+where nvcc
+nvcc --version
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+The CUDA version reported by `nvcc --version` should match `torch.version.cuda` as closely as possible, and `where cl` should point to the Visual Studio 2022 compiler, not a newer preview compiler. For an RTX 3090, setting the architecture also avoids compiling unnecessary targets:
+
+```batch
+conda activate resplat
+python -m pip install ninja
+set DISTUTILS_USE_SDK=1
+set TORCH_CUDA_ARCH_LIST=8.6
+python -m pip install --no-build-isolation git+https://github.com/nerfstudio-project/gsplat.git@v1.5.3
+```
+
+Set `DISTUTILS_USE_SDK=1` only after opening the x64 Visual Studio 2022 developer prompt or calling `vcvars64.bat`; PyTorch's extension builder expects it when the Visual C++ environment is already initialized.
+
 ### COLMAP
 
 COLMAP is required only if you want to prepare your own image folders for ReSplat inference with [scripts/prepare_colmap_scene.py](scripts/prepare_colmap_scene.py). It is an external executable, not a pip dependency.
