@@ -47,6 +47,72 @@ MODEL_PRESETS = [
     "dl3dv_8v_256x448_large",
 ]
 
+MODEL_PRESET_DESCRIPTIONS = {
+    "dl3dv_8v_512x960": (
+        "Meaning: Base DL3DV model, 8 context views, high-resolution 512x960 training.\n"
+        "Best use: Recommended default for good quality when you have enough VRAM."
+    ),
+    "dl3dv_16v_540x960": (
+        "Meaning: Base DL3DV model, 16 context views, high-resolution 540x960 training.\n"
+        "Best use: Scenes with many well-registered images where extra view coverage helps."
+    ),
+    "dl3dv_8v_256x448": (
+        "Meaning: Base DL3DV model, 8 context views, low-resolution 256x448 training.\n"
+        "Best use: Faster runs or lower-VRAM GPUs, with lower image detail."
+    ),
+    "dl3dv_16v_256x448": (
+        "Meaning: Base DL3DV model, 16 context views, low-resolution 256x448 training.\n"
+        "Best use: Lower-VRAM 16-view inference when your scene has many usable views."
+    ),
+    "dl3dv_32v_256x448": (
+        "Meaning: Base DL3DV model, 32 context views, low-resolution 256x448 training.\n"
+        "Best use: Broad scene coverage from many registered images, while staying low-res."
+    ),
+    "dl3dv_8v_256x448_small": (
+        "Meaning: Small ViT-S DL3DV model, 8 context views, low-resolution 256x448 training.\n"
+        "Best use: Lowest memory/faster inference when quality is less critical."
+    ),
+    "dl3dv_8v_256x448_large": (
+        "Meaning: Large ViT-L DL3DV model, 8 context views, low-resolution 256x448 training, init-only.\n"
+        "Best use: Testing the larger backbone without recurrent refinement."
+    ),
+}
+
+CAMERA_MODELS = [
+    "OPENCV",
+    "SIMPLE_RADIAL",
+    "RADIAL",
+    "SIMPLE_PINHOLE",
+    "PINHOLE",
+    "OPENCV_FISHEYE",
+]
+
+CAMERA_MODEL_DESCRIPTIONS = {
+    "OPENCV": (
+        "Use for most phone, action-camera, and normal lens image sets where focal length, "
+        "principal point, and radial/tangential distortion should be estimated."
+    ),
+    "SIMPLE_RADIAL": (
+        "Use for simple datasets from one camera when you want COLMAP to estimate one focal "
+        "length and lightweight radial distortion."
+    ),
+    "RADIAL": (
+        "Use when a normal lens has more noticeable radial distortion than SIMPLE_RADIAL "
+        "can model."
+    ),
+    "SIMPLE_PINHOLE": (
+        "Use for already-undistorted images with a single focal length and no lens "
+        "distortion model."
+    ),
+    "PINHOLE": (
+        "Use for already-undistorted images where horizontal and vertical focal lengths may "
+        "differ."
+    ),
+    "OPENCV_FISHEYE": (
+        "Use for fisheye or very wide-angle lenses. Avoid it for normal phone/camera photos."
+    ),
+}
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -448,15 +514,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--camera_model",
         type=str,
-        default="SIMPLE_RADIAL",
-        choices=[
-            "SIMPLE_PINHOLE",
-            "PINHOLE",
-            "SIMPLE_RADIAL",
-            "RADIAL",
-            "OPENCV",
-            "OPENCV_FISHEYE",
-        ],
+        default="OPENCV",
+        choices=CAMERA_MODELS,
         help=(
             "Initial COLMAP camera model for raw images. Distorted models are OK "
             "because image_undistorter produces the final PINHOLE-style scene."
@@ -558,11 +617,127 @@ def launch_gui() -> None:
     root.title("COLMAP and ReSplat Processor")
     root.geometry("920x760")
 
+    class Tooltip:
+        def __init__(self, parent: tk.Tk) -> None:
+            self.parent = parent
+            self.tip: tk.Toplevel | None = None
+            self.text = ""
+
+        def show(self, text: str, x: int | None = None, y: int | None = None) -> None:
+            if not text:
+                self.hide()
+                return
+            self.text = text
+            if self.tip is None or not self.tip.winfo_exists():
+                self.tip = tk.Toplevel(self.parent)
+                self.tip.wm_overrideredirect(True)
+                self.tip.wm_attributes("-topmost", True)
+                self.tip.transient(self.parent)
+                label = tk.Label(
+                    self.tip,
+                    text=text,
+                    justify="left",
+                    background="#ffffe0",
+                    relief="solid",
+                    borderwidth=1,
+                    padx=6,
+                    pady=4,
+                    wraplength=420,
+                )
+                label.pack()
+            else:
+                label = self.tip.winfo_children()[0]
+                label.configure(text=text)
+
+            if x is None:
+                x = self.parent.winfo_pointerx() + 16
+            if y is None:
+                y = self.parent.winfo_pointery() + 12
+            self.tip.wm_geometry(f"+{x}+{y}")
+            self.tip.lift()
+            self.tip.update_idletasks()
+
+        def hide(self) -> None:
+            if self.tip is not None and self.tip.winfo_exists():
+                self.tip.destroy()
+            self.tip = None
+
+    tooltip = Tooltip(root)
+
+    def add_tooltip(widget: tk.Widget, get_text: Callable[[], str]) -> None:
+        def show(event: tk.Event) -> None:
+            tooltip.show(get_text(), event.x_root + 16, event.y_root + 12)
+
+        widget.bind("<Enter>", show)
+        widget.bind("<Motion>", show)
+        widget.bind("<Leave>", lambda _event: tooltip.hide())
+
+    def add_menu_tooltips(menu: tk.Menu, descriptions: dict[str, str]) -> None:
+        active_tip_index: int | None = None
+        hide_job: str | None = None
+
+        def pointer_menu_index() -> int | None:
+            if not menu.winfo_ismapped():
+                return None
+
+            pointer_x = root.winfo_pointerx()
+            pointer_y = root.winfo_pointery()
+            menu_x = menu.winfo_rootx()
+            menu_y = menu.winfo_rooty()
+            if (
+                pointer_x < menu_x
+                or pointer_y < menu_y
+                or pointer_x > menu_x + menu.winfo_width()
+                or pointer_y > menu_y + menu.winfo_height()
+            ):
+                return None
+
+            index = menu.index(f"@{pointer_y - menu_y}")
+            if index is None or menu.type(index) in {"separator", "tearoff"}:
+                return None
+            return int(index)
+
+        def stop_tracking() -> None:
+            nonlocal active_tip_index, hide_job
+            if hide_job is not None:
+                root.after_cancel(hide_job)
+                hide_job = None
+            active_tip_index = None
+            tooltip.hide()
+
+        def track_pointer() -> None:
+            nonlocal active_tip_index, hide_job
+            current_index = pointer_menu_index()
+            if current_index != active_tip_index:
+                stop_tracking()
+                return
+            hide_job = root.after(80, track_pointer)
+
+        def show_active(event: tk.Event) -> None:
+            nonlocal active_tip_index, hide_job
+            active = menu.index("active")
+            if active is None:
+                stop_tracking()
+                return
+            label = menu.entrycget(active, "label")
+            x_root = getattr(event, "x_root", root.winfo_pointerx())
+            y_root = getattr(event, "y_root", root.winfo_pointery())
+            tooltip.show(descriptions.get(label, ""), x_root + 16, y_root + 12)
+            active_tip_index = int(active)
+            if hide_job is None:
+                hide_job = root.after(80, track_pointer)
+
+        menu.bind("<Motion>", show_active)
+        menu.bind("<<MenuSelect>>", show_active)
+        menu.bind("<Leave>", lambda _event: stop_tracking())
+        menu.bind("<ButtonRelease>", lambda _event: stop_tracking())
+        menu.bind("<Unmap>", lambda _event: stop_tracking())
+
     image_dir_var = tk.StringVar()
     output_root_var = tk.StringVar(value=str(default_output_root()))
     scene_name_var = tk.StringVar()
     colmap_var = tk.StringVar(value=shutil.which("colmap") or "colmap")
-    camera_model_var = tk.StringVar(value="SIMPLE_RADIAL")
+    camera_model_var = tk.StringVar(value="OPENCV")
     single_camera_var = tk.BooleanVar(value=True)
     max_image_size_var = tk.StringVar(value="2000")
     overwrite_var = tk.BooleanVar(value=False)
@@ -798,12 +973,15 @@ def launch_gui() -> None:
     camera_menu = tk.OptionMenu(
         step1_frame,
         camera_model_var,
-        "SIMPLE_RADIAL",
-        "RADIAL",
-        "OPENCV",
-        "SIMPLE_PINHOLE",
-        "PINHOLE",
-        "OPENCV_FISHEYE",
+        *CAMERA_MODELS,
+    )
+    add_tooltip(
+        camera_menu,
+        lambda: CAMERA_MODEL_DESCRIPTIONS.get(camera_model_var.get(), ""),
+    )
+    add_menu_tooltips(
+        camera_menu.nametowidget(camera_menu["menu"]),
+        CAMERA_MODEL_DESCRIPTIONS,
     )
     add_row(step1_frame, 4, "Raw camera model", camera_menu)
     add_row(step1_frame, 5, "Max image size", tk.Entry(step1_frame, textvariable=max_image_size_var))
@@ -846,7 +1024,16 @@ def launch_gui() -> None:
     tk.Label(step2_frame, text="Model preset", anchor="w", width=18).grid(
         row=2, column=0, sticky="w", pady=3
     )
-    tk.OptionMenu(step2_frame, model_preset_var, *MODEL_PRESETS).grid(
+    model_preset_menu = tk.OptionMenu(step2_frame, model_preset_var, *MODEL_PRESETS)
+    add_tooltip(
+        model_preset_menu,
+        lambda: MODEL_PRESET_DESCRIPTIONS.get(model_preset_var.get(), ""),
+    )
+    add_menu_tooltips(
+        model_preset_menu.nametowidget(model_preset_menu["menu"]),
+        MODEL_PRESET_DESCRIPTIONS,
+    )
+    model_preset_menu.grid(
         row=2, column=1, sticky="w", pady=3
     )
     tk.Label(step2_frame, text="Device", anchor="w", width=18).grid(
