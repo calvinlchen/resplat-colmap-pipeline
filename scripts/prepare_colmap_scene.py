@@ -1024,10 +1024,9 @@ def launch_gui() -> None:
             set_widget_tree_enabled(child, enabled)
 
     def set_running(active_step: str | None) -> None:
-        step1_enabled = active_step is None or active_step == "step1"
-        step2_enabled = active_step is None or active_step == "step2"
-        set_widget_tree_enabled(step1_frame, step1_enabled)
-        set_widget_tree_enabled(step2_frame, step2_enabled)
+        form_enabled = active_step is None
+        set_widget_tree_enabled(step1_frame, form_enabled)
+        set_widget_tree_enabled(step2_frame, form_enabled)
         run_step1_button.configure(
             state="disabled" if active_step is not None else "normal"
         )
@@ -1102,25 +1101,28 @@ def launch_gui() -> None:
                         append_log,
                     )
             except Exception as exc:
-                root.after(
-                    0,
-                    lambda exc=exc: messagebox.showerror("Preparation failed", str(exc)),
-                )
-                root.after(0, lambda exc=exc: append_log_direct(f"\nERROR: {exc}"))
+                def handle_error(exc: Exception = exc) -> None:
+                    set_running(None)
+                    append_log_direct(f"\nERROR: {exc}")
+                    messagebox.showerror("Preparation failed", str(exc))
+
+                root.after(0, handle_error)
             else:
-                root.after(
-                    0,
-                    lambda scene_dir=scene_dir, result_dir=result_dir: messagebox.showinfo(
+                def handle_success(
+                    scene_dir: Path = scene_dir,
+                    result_dir: Path | None = result_dir,
+                ) -> None:
+                    set_running(None)
+                    messagebox.showinfo(
                         "Done",
                         (
                             f"Step 1 complete. Ready for Step 2:\n{scene_dir}"
                             if result_dir is None
                             else f"Step 1 scene:\n{scene_dir}\n\nStep 2 results:\n{result_dir}"
                         ),
-                    ),
-                )
-            finally:
-                root.after(0, lambda: set_running(None))
+                    )
+
+                root.after(0, handle_success)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1145,20 +1147,20 @@ def launch_gui() -> None:
                     append_log,
                 )
             except Exception as exc:
-                root.after(
-                    0,
-                    lambda exc=exc: messagebox.showerror("ReSplat failed", str(exc)),
-                )
-                root.after(0, lambda exc=exc: append_log_direct(f"\nERROR: {exc}"))
+                def handle_error(exc: Exception = exc) -> None:
+                    set_running(None)
+                    append_log_direct(f"\nERROR: {exc}")
+                    messagebox.showerror("ReSplat failed", str(exc))
+
+                root.after(0, handle_error)
             else:
-                root.after(
-                    0,
-                    lambda result_dir=result_dir: messagebox.showinfo(
+                def handle_success(result_dir: Path = result_dir) -> None:
+                    set_running(None)
+                    messagebox.showinfo(
                         "Step 2 complete", f"ReSplat results:\n{result_dir}"
-                    ),
-                )
-            finally:
-                root.after(0, lambda: set_running(None))
+                    )
+
+                root.after(0, handle_success)
 
         threading.Thread(target=worker, daemon=True).start()
 
