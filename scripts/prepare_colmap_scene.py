@@ -983,11 +983,13 @@ def launch_gui() -> None:
             image_dir_var.set(selected)
             if not scene_name_var.get().strip():
                 scene_name_var.set(sanitize_scene_name(Path(selected).name))
+        root.after_idle(lambda: set_running(None))
 
     def browse_output() -> None:
         selected = filedialog.askdirectory(title="Select output root folder")
         if selected:
             output_root_var.set(selected)
+        root.after_idle(lambda: set_running(None))
 
     def browse_colmap() -> None:
         selected = filedialog.askopenfilename(
@@ -996,11 +998,13 @@ def launch_gui() -> None:
         )
         if selected:
             colmap_var.set(selected)
+        root.after_idle(lambda: set_running(None))
 
     def browse_resplat_output() -> None:
         selected = filedialog.askdirectory(title="Select ReSplat output root folder")
         if selected:
             resplat_output_root_var.set(selected)
+        root.after_idle(lambda: set_running(None))
 
     def browse_prepared_scene() -> None:
         selected = filedialog.askdirectory(
@@ -1013,20 +1017,25 @@ def launch_gui() -> None:
             step2_scene_path_var.set(str(selected_path))
             if not scene_name_var.get().strip():
                 scene_name_var.set(sanitize_scene_name(selected_path.name))
+        root.after_idle(lambda: set_running(None))
 
-    def set_widget_tree_enabled(widget: tk.Widget, enabled: bool) -> None:
+    interactive_widgets: list[tk.Widget] = []
+
+    def register_interactive(widget: tk.Widget) -> tk.Widget:
+        interactive_widgets.append(widget)
+        return widget
+
+    def set_widget_enabled(widget: tk.Widget, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         try:
             widget.configure(state=state)
         except tk.TclError:
             pass
-        for child in widget.winfo_children():
-            set_widget_tree_enabled(child, enabled)
 
     def set_running(active_step: str | None) -> None:
         form_enabled = active_step is None
-        set_widget_tree_enabled(step1_frame, form_enabled)
-        set_widget_tree_enabled(step2_frame, form_enabled)
+        for widget in interactive_widgets:
+            set_widget_enabled(widget, form_enabled)
         run_step1_button.configure(
             state="disabled" if active_step is not None else "normal"
         )
@@ -1169,9 +1178,13 @@ def launch_gui() -> None:
 
     def add_row(parent: tk.Widget, row: int, label: str, widget: tk.Widget, browse: Callable[[], None] | None = None) -> None:
         tk.Label(parent, text=label, anchor="w", width=18).grid(row=row, column=0, sticky="w", pady=4)
+        register_interactive(widget)
         widget.grid(row=row, column=1, sticky="ew", pady=4)
         if browse:
-            tk.Button(parent, text="Browse", command=browse).grid(row=row, column=2, padx=(8, 0), pady=4)
+            browse_button = register_interactive(
+                tk.Button(parent, text="Browse", command=browse)
+            )
+            browse_button.grid(row=row, column=2, padx=(8, 0), pady=4)
 
     form.columnconfigure(1, weight=1)
 
@@ -1196,13 +1209,17 @@ def launch_gui() -> None:
     add_row(step1_frame, 5, "Max image size", tk.Entry(step1_frame, textvariable=max_image_size_var))
 
     options = tk.Frame(step1_frame)
-    tk.Checkbutton(options, text="Shared camera calibration", variable=single_camera_var).pack(side="left")
-    tk.Checkbutton(options, text="Overwrite existing scene", variable=overwrite_var).pack(
+    register_interactive(
+        tk.Checkbutton(options, text="Shared camera calibration", variable=single_camera_var)
+    ).pack(side="left")
+    register_interactive(
+        tk.Checkbutton(options, text="Overwrite existing scene", variable=overwrite_var)
+    ).pack(
         side="left", padx=(18, 0)
     )
-    tk.Checkbutton(
+    register_interactive(tk.Checkbutton(
         options, text="Run Step 2 after Step 1", variable=run_step2_after_step1_var
-    ).pack(side="left", padx=(18, 0))
+    )).pack(side="left", padx=(18, 0))
     options.grid(row=6, column=1, sticky="w", pady=4)
 
     run_step1_button = tk.Button(
@@ -1248,36 +1265,45 @@ def launch_gui() -> None:
             )
         ),
     )
+    register_interactive(model_preset_menu)
     model_preset_menu.grid(
         row=2, column=1, sticky="w", pady=3
     )
     tk.Label(step2_frame, text="Device", anchor="w", width=18).grid(
         row=3, column=0, sticky="w", pady=3
     )
-    tk.Entry(step2_frame, textvariable=device_var).grid(
+    register_interactive(tk.Entry(step2_frame, textvariable=device_var)).grid(
         row=3, column=1, sticky="ew", pady=3
     )
     tk.Label(step2_frame, text="Render chunk size", anchor="w", width=18).grid(
         row=4, column=0, sticky="w", pady=3
     )
-    tk.Entry(step2_frame, textvariable=render_chunk_size_var).grid(
+    register_interactive(tk.Entry(step2_frame, textvariable=render_chunk_size_var)).grid(
         row=4, column=1, sticky="ew", pady=3
     )
 
     resplat_options = tk.Frame(step2_frame)
-    tk.Checkbutton(
+    register_interactive(tk.Checkbutton(
         resplat_options, text="Rendered images", variable=save_resplat_images_var
-    ).pack(side="left")
-    tk.Checkbutton(resplat_options, text="PLY", variable=save_ply_var).pack(
+    )).pack(side="left")
+    register_interactive(tk.Checkbutton(
+        resplat_options, text="PLY", variable=save_ply_var
+    )).pack(
         side="left", padx=(14, 0)
     )
-    tk.Checkbutton(resplat_options, text="Video", variable=save_video_var).pack(
+    register_interactive(tk.Checkbutton(
+        resplat_options, text="Video", variable=save_video_var
+    )).pack(
         side="left", padx=(14, 0)
     )
-    tk.Checkbutton(resplat_options, text="Depth", variable=save_depth_var).pack(
+    register_interactive(tk.Checkbutton(
+        resplat_options, text="Depth", variable=save_depth_var
+    )).pack(
         side="left", padx=(14, 0)
     )
-    tk.Checkbutton(resplat_options, text="Metrics", variable=eval_var).pack(
+    register_interactive(tk.Checkbutton(
+        resplat_options, text="Metrics", variable=eval_var
+    )).pack(
         side="left", padx=(14, 0)
     )
     resplat_options.grid(row=5, column=1, sticky="w", pady=3)
