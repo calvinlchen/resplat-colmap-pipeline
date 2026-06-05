@@ -22,6 +22,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -46,6 +48,16 @@ MODEL_PRESETS = [
     "dl3dv_8v_256x448_small",
     "dl3dv_8v_256x448_large",
 ]
+
+MODEL_PRESET_CHECKPOINTS = {
+    "dl3dv_8v_512x960": "resplat-base-dl3dv-512x960-view8-8179ed87.pth",
+    "dl3dv_16v_540x960": "resplat-base-dl3dv-540x960-view16-a72dc6d0.pth",
+    "dl3dv_8v_256x448": "resplat-base-dl3dv-256x448-view8-1934a04c.pth",
+    "dl3dv_16v_256x448": "resplat-base-dl3dv-256x448-view16-f38bf984.pth",
+    "dl3dv_32v_256x448": "resplat-base-dl3dv-256x448-view32-439b63a6.pth",
+    "dl3dv_8v_256x448_small": "resplat-small-dl3dv-256x448-view8-548993fe.pth",
+    "dl3dv_8v_256x448_large": "resplat-large-dl3dv-256x448-view8-62f1703a.pth",
+}
 
 MODEL_PRESET_DESCRIPTIONS = {
     "dl3dv_8v_512x960": (
@@ -77,6 +89,8 @@ MODEL_PRESET_DESCRIPTIONS = {
         "Best use: Testing the larger backbone without recurrent refinement."
     ),
 }
+
+MODEL_DOWNLOAD_BASE_URL = "https://huggingface.co/haofeixu/resplat/resolve/main"
 
 CAMERA_MODELS = [
     "OPENCV",
@@ -172,6 +186,93 @@ def ensure_colmap(colmap: str) -> str:
     )
 
 
+def model_checkpoint_relative_path(model_preset: str) -> Path:
+    try:
+        checkpoint_name = MODEL_PRESET_CHECKPOINTS[model_preset]
+    except KeyError as exc:
+        raise RuntimeError(f"Unknown model preset: {model_preset}") from exc
+    return Path("pretrained") / checkpoint_name
+
+
+def model_checkpoint_path(model_preset: str) -> Path:
+    return repo_root() / model_checkpoint_relative_path(model_preset)
+
+
+def model_download_url(model_preset: str) -> str:
+    try:
+        checkpoint_name = MODEL_PRESET_CHECKPOINTS[model_preset]
+    except KeyError as exc:
+        raise RuntimeError(f"Unknown model preset: {model_preset}") from exc
+    return f"{MODEL_DOWNLOAD_BASE_URL}/{checkpoint_name}"
+
+
+def model_checkpoint_exists(model_preset: str) -> bool:
+    checkpoint = model_checkpoint_path(model_preset)
+    return checkpoint.is_file() and checkpoint.stat().st_size > 0
+
+
+def ensure_model_checkpoint(
+    model_preset: str,
+    log: Callable[[str], None] = print,
+) -> Path:
+    checkpoint = model_checkpoint_path(model_preset)
+    if model_checkpoint_exists(model_preset):
+        log(f"Using downloaded model checkpoint: {checkpoint}")
+        return checkpoint
+
+    url = model_download_url(model_preset)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = checkpoint.with_suffix(checkpoint.suffix + ".download")
+
+    log(f"Model checkpoint not found: {checkpoint}")
+    log(f"Downloading {model_preset} from:")
+    log(url)
+
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "resplat-colmap-pipeline/1.0"},
+    )
+
+    try:
+        with urllib.request.urlopen(request) as response:
+            total_size = int(response.headers.get("Content-Length", "0") or "0")
+            downloaded = 0
+            next_progress = 0
+
+            with temp_path.open("wb") as file:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    file.write(chunk)
+                    downloaded += len(chunk)
+
+                    if total_size:
+                        progress = int(downloaded * 100 / total_size)
+                        if progress >= next_progress:
+                            log(
+                                "  Downloaded "
+                                f"{downloaded / (1024 * 1024):.1f} / "
+                                f"{total_size / (1024 * 1024):.1f} MiB "
+                                f"({progress}%)"
+                            )
+                            next_progress = progress + 10
+
+        temp_path.replace(checkpoint)
+    except (OSError, urllib.error.URLError) as exc:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            "Could not download the selected ReSplat model. Check your network "
+            f"connection or download it manually from MODEL_ZOO.md into {checkpoint.parent}."
+        ) from exc
+
+    log(f"Downloaded model checkpoint: {checkpoint}")
+    return checkpoint
+
+
 def run_command(
     command: list[str],
     log: Callable[[str], None],
@@ -207,6 +308,7 @@ def run_resplat_inference(
 ) -> Path:
     scene_dir = scene_dir.resolve()
     images_dir_name = validate_resplat_scene(scene_dir)
+    ensure_model_checkpoint(cfg.model_preset, log)
     output_dir = (cfg.output_root / sanitize_scene_name(scene_name)).resolve()
     if output_dir == scene_dir:
         output_dir = (cfg.output_root / f"{sanitize_scene_name(scene_name)}_resplat").resolve()
@@ -678,6 +780,8 @@ def launch_gui() -> None:
         values: list[str],
         descriptions: dict[str, str],
         width: int = 34,
+        indicator_text: Callable[[str], str] | None = None,
+        status_text: Callable[[str], str] | None = None,
     ) -> tk.Button:
         popup: tk.Toplevel | None = None
         active_description: tk.Toplevel | None = None
@@ -700,12 +804,32 @@ def launch_gui() -> None:
             popup = None
             active_description = None
 
-        def show_description(row: tk.Label, value: str) -> None:
+        def option_description(value: str) -> str:
+            description = descriptions.get(value, "")
+            if status_text is None:
+                return description
+            status = status_text(value)
+            if not status:
+                return description
+            return f"{description}\n\n{status}" if description else status
+
+        def set_row_background(row: tk.Widget, color: str) -> None:
+            try:
+                row.configure(background=color)
+            except tk.TclError:
+                pass
+            for child in row.winfo_children():
+                try:
+                    child.configure(background=color)
+                except tk.TclError:
+                    pass
+
+        def show_description(row: tk.Widget, value: str) -> None:
             nonlocal active_description
             if popup is None or not popup.winfo_exists():
                 return
 
-            row.configure(background="#e6f0ff")
+            set_row_background(row, "#e6f0ff")
             if active_description is None or not active_description.winfo_exists():
                 active_description = tk.Toplevel(root)
                 active_description.wm_overrideredirect(True)
@@ -713,7 +837,7 @@ def launch_gui() -> None:
                 active_description.transient(root)
                 label = tk.Label(
                     active_description,
-                    text=descriptions.get(value, ""),
+                    text=option_description(value),
                     justify="left",
                     background="#ffffe0",
                     relief="solid",
@@ -725,7 +849,7 @@ def launch_gui() -> None:
                 label.pack()
             else:
                 label = active_description.winfo_children()[0]
-                label.configure(text=descriptions.get(value, ""))
+                label.configure(text=option_description(value))
 
             popup.update_idletasks()
             active_description.update_idletasks()
@@ -740,9 +864,9 @@ def launch_gui() -> None:
             active_description.wm_geometry(f"+{x}+{y}")
             active_description.lift()
 
-        def hide_description(row: tk.Label) -> None:
+        def hide_description(row: tk.Widget) -> None:
             nonlocal active_description
-            row.configure(background="#ffffff")
+            set_row_background(row, "#ffffff")
             if active_description is not None and active_description.winfo_exists():
                 active_description.destroy()
             active_description = None
@@ -768,9 +892,25 @@ def launch_gui() -> None:
             )
             option_frame.grid(row=0, column=0, sticky="nw")
 
+            def bind_row(widget: tk.Widget, row: tk.Widget, value: str) -> None:
+                widget.bind("<Enter>", lambda _event: show_description(row, value))
+                widget.bind("<Motion>", lambda _event: show_description(row, value))
+                widget.bind("<Leave>", lambda _event: hide_description(row))
+                widget.bind(
+                    "<ButtonRelease-1>",
+                    lambda _event: (variable.set(value), close_popup()),
+                )
+
             for row_index, value in enumerate(values):
-                row = tk.Label(
+                row = tk.Frame(
                     option_frame,
+                    background="#ffffff",
+                )
+                row.grid(row=row_index, column=0, sticky="ew")
+                row.columnconfigure(0, weight=1)
+
+                text_label = tk.Label(
+                    row,
                     text=value,
                     anchor="w",
                     background="#ffffff",
@@ -778,14 +918,22 @@ def launch_gui() -> None:
                     pady=4,
                     width=width,
                 )
-                row.grid(row=row_index, column=0, sticky="ew")
-                row.bind("<Enter>", lambda _event, r=row, v=value: show_description(r, v))
-                row.bind("<Motion>", lambda _event, r=row, v=value: show_description(r, v))
-                row.bind("<Leave>", lambda _event, r=row: hide_description(r))
-                row.bind(
-                    "<ButtonRelease-1>",
-                    lambda _event, v=value: (variable.set(v), close_popup()),
+                text_label.grid(row=0, column=0, sticky="ew")
+
+                icon_label = tk.Label(
+                    row,
+                    text=indicator_text(value) if indicator_text is not None else "",
+                    anchor="e",
+                    background="#ffffff",
+                    padx=8,
+                    pady=4,
+                    width=2,
                 )
+                icon_label.grid(row=0, column=1, sticky="e")
+
+                bind_row(row, row, value)
+                bind_row(text_label, row, value)
+                bind_row(icon_label, row, value)
 
             x = button.winfo_rootx()
             y = button.winfo_rooty() + button.winfo_height()
@@ -796,7 +944,7 @@ def launch_gui() -> None:
             popup.focus_force()
 
         button.configure(command=open_popup)
-        add_tooltip(button, lambda: descriptions.get(variable.get(), ""))
+        add_tooltip(button, lambda: option_description(variable.get()))
         return button
 
     image_dir_var = tk.StringVar()
@@ -1088,6 +1236,15 @@ def launch_gui() -> None:
         model_preset_var,
         MODEL_PRESETS,
         MODEL_PRESET_DESCRIPTIONS,
+        indicator_text=lambda value: "" if model_checkpoint_exists(value) else "\u2b07",
+        status_text=lambda value: (
+            f"Downloaded: {model_checkpoint_path(value)}"
+            if model_checkpoint_exists(value)
+            else (
+                "Not downloaded yet. This model will be downloaded into "
+                f"{model_checkpoint_path(value).parent} when Step 2 starts."
+            )
+        ),
     )
     model_preset_menu.grid(
         row=2, column=1, sticky="w", pady=3
