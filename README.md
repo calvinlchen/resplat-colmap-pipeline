@@ -51,6 +51,22 @@ pip install --no-build-isolation git+https://github.com/nerfstudio-project/gspla
 cd src/model/encoder/pointops && python setup.py install && cd ../../../..
 ```
 
+### COLMAP
+
+COLMAP is required only if you want to prepare your own image folders for ReSplat inference with [scripts/prepare_colmap_scene.py](scripts/prepare_colmap_scene.py). It is an external executable, not a pip dependency.
+
+Install COLMAP from the official releases page:
+
+- Windows: download the latest Windows build from [COLMAP releases](https://github.com/colmap/colmap/releases), unzip it, and either add the folder containing `colmap.exe` to your `PATH` or select `colmap.exe` manually in the preparation app.
+- Linux: install from your package manager if available, for example `sudo apt install colmap`, or follow the official build instructions if you need CUDA support.
+- macOS: install with Homebrew using `brew install colmap`, or use the official build instructions.
+
+Verify installation with:
+
+```bash
+colmap -h
+```
+
 ## Model Zoo
 
 Pre-trained models are available in the [Model Zoo](MODEL_ZOO.md).
@@ -82,6 +98,35 @@ ln -s YOUR_DATASET_PATH datasets
 Check [scripts/infer_colmap.sh](scripts/infer_colmap.sh) for running our pre-trained models on COLMAP datasets.
 
 A demo scene can be downloaded [here](https://huggingface.co/datasets/haofeixu/depthsplat/resolve/main/dl3dv-colmap-demo.zip) to quickly try our method.
+
+## Preparing Custom COLMAP Scenes
+
+ReSplat inference expects undistorted COLMAP scenes with this layout:
+
+```text
+<scene_dir>/
+  images/
+  sparse/0/
+    cameras.bin
+    images.bin
+```
+
+You can prepare this layout from a folder of raw images with the local folder-picker utility:
+
+```bash
+python scripts/prepare_colmap_scene.py
+```
+
+The same tool can run without the GUI:
+
+```bash
+python scripts/prepare_colmap_scene.py \
+    --image_dir /path/to/raw/images \
+    --output_root datasets/colmap-custom \
+    --scene_name my_scene
+```
+
+The tool runs COLMAP feature extraction, matching, mapping, and image undistortion, then copies the undistorted images and sparse camera model into the `images/` and `sparse/0/` folders required by [scripts/infer_colmap.py](scripts/infer_colmap.py).
 
 
 ## Evaluation
