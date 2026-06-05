@@ -48,7 +48,9 @@ pip install -r requirements.txt
 pip install --no-build-isolation git+https://github.com/nerfstudio-project/gsplat.git@v1.5.3
 
 # Install pointops (kNN)
-cd src/model/encoder/pointops && python setup.py install && cd ../../../..
+cd src/model/encoder/pointops
+python setup.py install
+cd ../../../..
 ```
 
 ### Windows CUDA Extension Build Notes
@@ -75,6 +77,18 @@ python -m pip install --no-build-isolation git+https://github.com/nerfstudio-pro
 ```
 
 Set `DISTUTILS_USE_SDK=1` only after opening the x64 Visual Studio 2022 developer prompt or calling `vcvars64.bat`; PyTorch's extension builder expects it when the Visual C++ environment is already initialized.
+
+For `pointops` on Windows, activate conda first, then initialize the Visual Studio environment. Running `conda activate` after `vcvars64.bat` can remove `cl.exe` from `PATH`:
+
+```batch
+call "%USERPROFILE%\anaconda3\condabin\conda.bat" activate resplat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+set DISTUTILS_USE_SDK=1
+set TORCH_CUDA_ARCH_LIST=8.6
+cd src\model\encoder\pointops
+python setup.py install
+cd ..\..\..\..
+```
 
 ### COLMAP
 
