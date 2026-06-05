@@ -672,66 +672,132 @@ def launch_gui() -> None:
         widget.bind("<Motion>", show)
         widget.bind("<Leave>", lambda _event: tooltip.hide())
 
-    def add_menu_tooltips(menu: tk.Menu, descriptions: dict[str, str]) -> None:
-        active_tip_index: int | None = None
-        hide_job: str | None = None
+    def create_described_dropdown(
+        parent: tk.Widget,
+        variable: tk.StringVar,
+        values: list[str],
+        descriptions: dict[str, str],
+        width: int = 34,
+    ) -> tk.Button:
+        popup: tk.Toplevel | None = None
+        active_description: tk.Toplevel | None = None
 
-        def pointer_menu_index() -> int | None:
-            if not menu.winfo_ismapped():
-                return None
+        button = tk.Button(
+            parent,
+            textvariable=variable,
+            anchor="w",
+            width=width,
+            relief="raised",
+            padx=8,
+        )
 
-            pointer_x = root.winfo_pointerx()
-            pointer_y = root.winfo_pointery()
-            menu_x = menu.winfo_rootx()
-            menu_y = menu.winfo_rooty()
-            if (
-                pointer_x < menu_x
-                or pointer_y < menu_y
-                or pointer_x > menu_x + menu.winfo_width()
-                or pointer_y > menu_y + menu.winfo_height()
-            ):
-                return None
+        def close_popup() -> None:
+            nonlocal popup, active_description
+            if active_description is not None and active_description.winfo_exists():
+                active_description.destroy()
+            if popup is not None and popup.winfo_exists():
+                popup.destroy()
+            popup = None
+            active_description = None
 
-            index = menu.index(f"@{pointer_y - menu_y}")
-            if index is None or menu.type(index) in {"separator", "tearoff"}:
-                return None
-            return int(index)
+        def show_description(row: tk.Label, value: str) -> None:
+            nonlocal active_description
+            if popup is None or not popup.winfo_exists():
+                return
 
-        def stop_tracking() -> None:
-            nonlocal active_tip_index, hide_job
-            if hide_job is not None:
-                root.after_cancel(hide_job)
-                hide_job = None
-            active_tip_index = None
+            row.configure(background="#e6f0ff")
+            if active_description is None or not active_description.winfo_exists():
+                active_description = tk.Toplevel(root)
+                active_description.wm_overrideredirect(True)
+                active_description.wm_attributes("-topmost", True)
+                active_description.transient(root)
+                label = tk.Label(
+                    active_description,
+                    text=descriptions.get(value, ""),
+                    justify="left",
+                    background="#ffffe0",
+                    relief="solid",
+                    borderwidth=1,
+                    padx=6,
+                    pady=4,
+                    wraplength=420,
+                )
+                label.pack()
+            else:
+                label = active_description.winfo_children()[0]
+                label.configure(text=descriptions.get(value, ""))
+
+            popup.update_idletasks()
+            active_description.update_idletasks()
+            x = popup.winfo_rootx() + popup.winfo_width() + 8
+            y = row.winfo_rooty()
+            screen_width = root.winfo_screenwidth()
+            screen_height = root.winfo_screenheight()
+            if x + active_description.winfo_reqwidth() > screen_width:
+                x = max(0, popup.winfo_rootx() - active_description.winfo_reqwidth() - 8)
+            if y + active_description.winfo_reqheight() > screen_height:
+                y = max(0, screen_height - active_description.winfo_reqheight() - 8)
+            active_description.wm_geometry(f"+{x}+{y}")
+            active_description.lift()
+
+        def hide_description(row: tk.Label) -> None:
+            nonlocal active_description
+            row.configure(background="#ffffff")
+            if active_description is not None and active_description.winfo_exists():
+                active_description.destroy()
+            active_description = None
+
+        def open_popup() -> None:
+            nonlocal popup
+            if popup is not None and popup.winfo_exists():
+                close_popup()
+                return
+
             tooltip.hide()
+            popup = tk.Toplevel(root)
+            popup.wm_overrideredirect(True)
+            popup.wm_attributes("-topmost", True)
+            popup.transient(root)
+            popup.configure(background="#ffffff")
 
-        def track_pointer() -> None:
-            nonlocal active_tip_index, hide_job
-            current_index = pointer_menu_index()
-            if current_index != active_tip_index:
-                stop_tracking()
-                return
-            hide_job = root.after(80, track_pointer)
+            option_frame = tk.Frame(
+                popup,
+                background="#ffffff",
+                relief="solid",
+                borderwidth=1,
+            )
+            option_frame.grid(row=0, column=0, sticky="nw")
 
-        def show_active(event: tk.Event) -> None:
-            nonlocal active_tip_index, hide_job
-            active = menu.index("active")
-            if active is None:
-                stop_tracking()
-                return
-            label = menu.entrycget(active, "label")
-            x_root = getattr(event, "x_root", root.winfo_pointerx())
-            y_root = getattr(event, "y_root", root.winfo_pointery())
-            tooltip.show(descriptions.get(label, ""), x_root + 16, y_root + 12)
-            active_tip_index = int(active)
-            if hide_job is None:
-                hide_job = root.after(80, track_pointer)
+            for row_index, value in enumerate(values):
+                row = tk.Label(
+                    option_frame,
+                    text=value,
+                    anchor="w",
+                    background="#ffffff",
+                    padx=10,
+                    pady=4,
+                    width=width,
+                )
+                row.grid(row=row_index, column=0, sticky="ew")
+                row.bind("<Enter>", lambda _event, r=row, v=value: show_description(r, v))
+                row.bind("<Motion>", lambda _event, r=row, v=value: show_description(r, v))
+                row.bind("<Leave>", lambda _event, r=row: hide_description(r))
+                row.bind(
+                    "<ButtonRelease-1>",
+                    lambda _event, v=value: (variable.set(v), close_popup()),
+                )
 
-        menu.bind("<Motion>", show_active)
-        menu.bind("<<MenuSelect>>", show_active)
-        menu.bind("<Leave>", lambda _event: stop_tracking())
-        menu.bind("<ButtonRelease>", lambda _event: stop_tracking())
-        menu.bind("<Unmap>", lambda _event: stop_tracking())
+            x = button.winfo_rootx()
+            y = button.winfo_rooty() + button.winfo_height()
+            popup.wm_geometry(f"+{x}+{y}")
+            popup.lift()
+            popup.bind("<Escape>", lambda _event: close_popup())
+            popup.bind("<FocusOut>", lambda _event: close_popup())
+            popup.focus_force()
+
+        button.configure(command=open_popup)
+        add_tooltip(button, lambda: descriptions.get(variable.get(), ""))
+        return button
 
     image_dir_var = tk.StringVar()
     output_root_var = tk.StringVar(value=str(default_output_root()))
@@ -970,17 +1036,10 @@ def launch_gui() -> None:
     add_row(step1_frame, 2, "Scene name", tk.Entry(step1_frame, textvariable=scene_name_var))
     add_row(step1_frame, 3, "COLMAP", tk.Entry(step1_frame, textvariable=colmap_var), browse_colmap)
 
-    camera_menu = tk.OptionMenu(
+    camera_menu = create_described_dropdown(
         step1_frame,
         camera_model_var,
-        *CAMERA_MODELS,
-    )
-    add_tooltip(
-        camera_menu,
-        lambda: CAMERA_MODEL_DESCRIPTIONS.get(camera_model_var.get(), ""),
-    )
-    add_menu_tooltips(
-        camera_menu.nametowidget(camera_menu["menu"]),
+        CAMERA_MODELS,
         CAMERA_MODEL_DESCRIPTIONS,
     )
     add_row(step1_frame, 4, "Raw camera model", camera_menu)
@@ -1024,13 +1083,10 @@ def launch_gui() -> None:
     tk.Label(step2_frame, text="Model preset", anchor="w", width=18).grid(
         row=2, column=0, sticky="w", pady=3
     )
-    model_preset_menu = tk.OptionMenu(step2_frame, model_preset_var, *MODEL_PRESETS)
-    add_tooltip(
-        model_preset_menu,
-        lambda: MODEL_PRESET_DESCRIPTIONS.get(model_preset_var.get(), ""),
-    )
-    add_menu_tooltips(
-        model_preset_menu.nametowidget(model_preset_menu["menu"]),
+    model_preset_menu = create_described_dropdown(
+        step2_frame,
+        model_preset_var,
+        MODEL_PRESETS,
         MODEL_PRESET_DESCRIPTIONS,
     )
     model_preset_menu.grid(
