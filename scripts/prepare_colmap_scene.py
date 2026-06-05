@@ -19,6 +19,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -158,6 +159,58 @@ class ReSplatRunConfig:
     render_chunk_size: int
 
 
+class OperationCancelled(RuntimeError):
+    pass
+
+
+class CancellationController:
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
+
+    def cancel(self) -> None:
+        self._event.set()
+        with self._lock:
+            process = self._process
+        if process is not None and process.poll() is None:
+            terminate_process_tree(process)
+
+    def check(self) -> None:
+        if self._event.is_set():
+            raise OperationCancelled("Operation stopped by user.")
+
+    def track(self, process: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._process = process
+        if self._event.is_set() and process.poll() is None:
+            terminate_process_tree(process)
+
+    def untrack(self, process: subprocess.Popen[str]) -> None:
+        with self._lock:
+            if self._process is process:
+                self._process = None
+
+
+def terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        process.terminate()
+
+
 def sanitize_scene_name(name: str) -> str:
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
     name = name.strip("._-")
@@ -214,6 +267,7 @@ def model_checkpoint_exists(model_preset: str) -> bool:
 def ensure_model_checkpoint(
     model_preset: str,
     log: Callable[[str], None] = print,
+    cancellation: CancellationController | None = None,
 ) -> Path:
     checkpoint = model_checkpoint_path(model_preset)
     if model_checkpoint_exists(model_preset):
@@ -234,6 +288,8 @@ def ensure_model_checkpoint(
     )
 
     try:
+        if cancellation is not None:
+            cancellation.check()
         with urllib.request.urlopen(request) as response:
             total_size = int(response.headers.get("Content-Length", "0") or "0")
             downloaded = 0
@@ -241,6 +297,8 @@ def ensure_model_checkpoint(
 
             with temp_path.open("wb") as file:
                 while True:
+                    if cancellation is not None:
+                        cancellation.check()
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
@@ -259,11 +317,13 @@ def ensure_model_checkpoint(
                             next_progress = progress + 10
 
         temp_path.replace(checkpoint)
-    except (OSError, urllib.error.URLError) as exc:
+    except (OperationCancelled, OSError, urllib.error.URLError) as exc:
         try:
             temp_path.unlink()
         except OSError:
             pass
+        if isinstance(exc, OperationCancelled):
+            raise
         raise RuntimeError(
             "Could not download the selected ReSplat model. Check your network "
             f"connection or download it manually from MODEL_ZOO.md into {checkpoint.parent}."
@@ -277,10 +337,15 @@ def run_command(
     command: list[str],
     log: Callable[[str], None],
     cwd: Path | None = None,
+    cancellation: CancellationController | None = None,
 ) -> None:
+    if cancellation is not None:
+        cancellation.check()
     log("\n$ " + " ".join(f'"{part}"' if " " in part else part for part in command))
     if cwd is not None:
         log(f"Working directory: {cwd}")
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    start_new_session = os.name != "nt"
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -289,13 +354,30 @@ def run_command(
         encoding="utf-8",
         errors="replace",
         cwd=str(cwd) if cwd is not None else None,
+        creationflags=creationflags,
+        start_new_session=start_new_session,
     )
 
-    assert process.stdout is not None
-    for line in process.stdout:
-        log(line.rstrip())
+    if cancellation is not None:
+        cancellation.track(process)
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if cancellation is not None:
+                cancellation.check()
+            log(line.rstrip())
 
-    return_code = process.wait()
+        return_code = process.wait()
+    except OperationCancelled:
+        terminate_process_tree(process)
+        process.wait()
+        raise
+    finally:
+        if cancellation is not None:
+            cancellation.untrack(process)
+
+    if cancellation is not None:
+        cancellation.check()
     if return_code != 0:
         raise RuntimeError(f"Command failed with exit code {return_code}: {command[0]}")
 
@@ -305,10 +387,13 @@ def run_resplat_inference(
     scene_name: str,
     cfg: ReSplatRunConfig,
     log: Callable[[str], None] = print,
+    cancellation: CancellationController | None = None,
 ) -> Path:
     scene_dir = scene_dir.resolve()
     images_dir_name = validate_resplat_scene(scene_dir)
-    ensure_model_checkpoint(cfg.model_preset, log)
+    ensure_model_checkpoint(cfg.model_preset, log, cancellation)
+    if cancellation is not None:
+        cancellation.check()
     output_dir = (cfg.output_root / sanitize_scene_name(scene_name)).resolve()
     if output_dir == scene_dir:
         output_dir = (cfg.output_root / f"{sanitize_scene_name(scene_name)}_resplat").resolve()
@@ -348,7 +433,7 @@ def run_resplat_inference(
 
     log("\nRunning ReSplat inference on prepared scene...")
     log(f"Using image folder: {images_dir_name}")
-    run_command(command, log, cwd=repo_root())
+    run_command(command, log, cwd=repo_root(), cancellation=cancellation)
     log(f"\nReSplat results saved to: {output_dir}")
     return output_dir
 
@@ -453,7 +538,13 @@ def validate_safe_output(cfg: PrepareConfig, scene_dir: Path) -> None:
         )
 
 
-def prepare_scene(cfg: PrepareConfig, log: Callable[[str], None] = print) -> Path:
+def prepare_scene(
+    cfg: PrepareConfig,
+    log: Callable[[str], None] = print,
+    cancellation: CancellationController | None = None,
+) -> Path:
+    if cancellation is not None:
+        cancellation.check()
     cfg.image_dir = cfg.image_dir.resolve()
     cfg.output_root = cfg.output_root.resolve()
     cfg.scene_name = sanitize_scene_name(cfg.scene_name)
@@ -511,7 +602,7 @@ def prepare_scene(cfg: PrepareConfig, log: Callable[[str], None] = print) -> Pat
         "--ImageReader.single_camera",
         "1" if cfg.single_camera else "0",
     ]
-    run_command(feature_command, log)
+    run_command(feature_command, log, cancellation=cancellation)
 
     run_command(
         [
@@ -521,6 +612,7 @@ def prepare_scene(cfg: PrepareConfig, log: Callable[[str], None] = print) -> Pat
             str(database_path),
         ],
         log,
+        cancellation=cancellation,
     )
 
     run_command(
@@ -535,8 +627,11 @@ def prepare_scene(cfg: PrepareConfig, log: Callable[[str], None] = print) -> Pat
             str(sparse_raw_dir),
         ],
         log,
+        cancellation=cancellation,
     )
 
+    if cancellation is not None:
+        cancellation.check()
     sparse_model = choose_sparse_model(sparse_raw_dir)
     log(f"Using sparse model: {sparse_model}")
 
@@ -554,8 +649,10 @@ def prepare_scene(cfg: PrepareConfig, log: Callable[[str], None] = print) -> Pat
     ]
     if cfg.max_image_size > 0:
         undistort_command.extend(["--max_image_size", str(cfg.max_image_size)])
-    run_command(undistort_command, log)
+    run_command(undistort_command, log, cancellation=cancellation)
 
+    if cancellation is not None:
+        cancellation.check()
     undistorted_images = undistorted_dir / "images"
     undistorted_sparse = normalize_undistorted_sparse_path(undistorted_dir)
 
@@ -966,6 +1063,7 @@ def launch_gui() -> None:
     save_video_var = tk.BooleanVar(value=False)
     save_depth_var = tk.BooleanVar(value=False)
     eval_var = tk.BooleanVar(value=False)
+    active_controller: CancellationController | None = None
 
     def append_log_direct(text: str) -> None:
         log_box.configure(state="normal")
@@ -1042,6 +1140,17 @@ def launch_gui() -> None:
         run_step2_button.configure(
             state="disabled" if active_step is not None else "normal"
         )
+        stop_button.configure(
+            state="normal" if active_step is not None else "disabled"
+        )
+
+    def request_stop() -> None:
+        controller = active_controller
+        if controller is None:
+            return
+        stop_button.configure(state="disabled")
+        append_log("Stopping current process...")
+        controller.cancel()
 
     def build_step2_config() -> ReSplatRunConfig | None:
         try:
@@ -1066,6 +1175,7 @@ def launch_gui() -> None:
         )
 
     def start_step1() -> None:
+        nonlocal active_controller
         try:
             max_image_size = int(max_image_size_var.get())
         except ValueError:
@@ -1093,12 +1203,15 @@ def launch_gui() -> None:
         if run_step2_after_step1_var.get() and resplat_cfg is None:
             return
 
+        active_controller = CancellationController()
+        controller = active_controller
         set_running("step1")
         append_log("Starting Step 1: COLMAP preparation...")
 
         def worker() -> None:
             try:
-                scene_dir = prepare_scene(cfg, append_log)
+                scene_dir = prepare_scene(cfg, append_log, controller)
+                controller.check()
                 root.after(0, lambda scene_dir=scene_dir: step2_scene_path_var.set(str(scene_dir)))
                 result_dir = None
                 if resplat_cfg is not None:
@@ -1108,9 +1221,20 @@ def launch_gui() -> None:
                         cfg.scene_name,
                         resplat_cfg,
                         append_log,
+                        controller,
                     )
+            except OperationCancelled:
+                def handle_cancelled() -> None:
+                    nonlocal active_controller
+                    active_controller = None
+                    set_running(None)
+                    append_log_direct("\nStopped.")
+
+                root.after(0, handle_cancelled)
             except Exception as exc:
                 def handle_error(exc: Exception = exc) -> None:
+                    nonlocal active_controller
+                    active_controller = None
                     set_running(None)
                     append_log_direct(f"\nERROR: {exc}")
                     messagebox.showerror("Preparation failed", str(exc))
@@ -1121,6 +1245,8 @@ def launch_gui() -> None:
                     scene_dir: Path = scene_dir,
                     result_dir: Path | None = result_dir,
                 ) -> None:
+                    nonlocal active_controller
+                    active_controller = None
                     set_running(None)
                     messagebox.showinfo(
                         "Done",
@@ -1136,6 +1262,7 @@ def launch_gui() -> None:
         threading.Thread(target=worker, daemon=True).start()
 
     def start_step2() -> None:
+        nonlocal active_controller
         resplat_cfg = build_step2_config()
         if resplat_cfg is None:
             return
@@ -1144,6 +1271,8 @@ def launch_gui() -> None:
         scene_name = scene_name_var.get().strip() or sanitize_scene_name(scene_dir.name)
         scene_name_var.set(scene_name)
 
+        active_controller = CancellationController()
+        controller = active_controller
         set_running("step2")
         append_log("Starting Step 2: ReSplat inference...")
 
@@ -1154,9 +1283,20 @@ def launch_gui() -> None:
                     scene_name,
                     resplat_cfg,
                     append_log,
+                    controller,
                 )
+            except OperationCancelled:
+                def handle_cancelled() -> None:
+                    nonlocal active_controller
+                    active_controller = None
+                    set_running(None)
+                    append_log_direct("\nStopped.")
+
+                root.after(0, handle_cancelled)
             except Exception as exc:
                 def handle_error(exc: Exception = exc) -> None:
+                    nonlocal active_controller
+                    active_controller = None
                     set_running(None)
                     append_log_direct(f"\nERROR: {exc}")
                     messagebox.showerror("ReSplat failed", str(exc))
@@ -1164,6 +1304,8 @@ def launch_gui() -> None:
                 root.after(0, handle_error)
             else:
                 def handle_success(result_dir: Path = result_dir) -> None:
+                    nonlocal active_controller
+                    active_controller = None
                     set_running(None)
                     messagebox.showinfo(
                         "Step 2 complete", f"ReSplat results:\n{result_dir}"
@@ -1312,6 +1454,11 @@ def launch_gui() -> None:
         step2_frame, text="Run Step 2: ReSplat", command=start_step2
     )
     run_step2_button.grid(row=6, column=1, sticky="w", pady=(8, 4))
+
+    stop_button = tk.Button(
+        form, text="Stop Current Process", command=request_stop, state="disabled"
+    )
+    stop_button.grid(row=2, column=1, sticky="w", pady=(6, 10))
 
     log_box = scrolledtext.ScrolledText(root, state="disabled", height=22)
     log_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
