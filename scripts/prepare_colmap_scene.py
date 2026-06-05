@@ -37,6 +37,20 @@ IMAGE_EXTENSIONS = {
     ".webp",
 }
 
+MODEL_PRESETS = [
+    "dl3dv_8v_512x960",
+    "dl3dv_16v_540x960",
+    "dl3dv_8v_256x448",
+    "dl3dv_16v_256x448",
+    "dl3dv_32v_256x448",
+    "dl3dv_8v_256x448_small",
+    "dl3dv_8v_256x448_large",
+]
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
 
 @dataclass
 class PrepareConfig:
@@ -48,6 +62,20 @@ class PrepareConfig:
     single_camera: bool
     max_image_size: int
     overwrite: bool
+
+
+@dataclass
+class ReSplatRunConfig:
+    enabled: bool
+    model_preset: str
+    output_root: Path
+    device: str
+    save_images: bool
+    save_ply: bool
+    save_video: bool
+    save_depth: bool
+    no_eval: bool
+    render_chunk_size: int
 
 
 def sanitize_scene_name(name: str) -> str:
@@ -78,8 +106,14 @@ def ensure_colmap(colmap: str) -> str:
     )
 
 
-def run_command(command: list[str], log: Callable[[str], None]) -> None:
+def run_command(
+    command: list[str],
+    log: Callable[[str], None],
+    cwd: Path | None = None,
+) -> None:
     log("\n$ " + " ".join(f'"{part}"' if " " in part else part for part in command))
+    if cwd is not None:
+        log(f"Working directory: {cwd}")
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -87,6 +121,7 @@ def run_command(command: list[str], log: Callable[[str], None]) -> None:
         text=True,
         encoding="utf-8",
         errors="replace",
+        cwd=str(cwd) if cwd is not None else None,
     )
 
     assert process.stdout is not None
@@ -96,6 +131,99 @@ def run_command(command: list[str], log: Callable[[str], None]) -> None:
     return_code = process.wait()
     if return_code != 0:
         raise RuntimeError(f"Command failed with exit code {return_code}: {command[0]}")
+
+
+def run_resplat_inference(
+    scene_dir: Path,
+    scene_name: str,
+    cfg: ReSplatRunConfig,
+    log: Callable[[str], None] = print,
+) -> Path:
+    scene_dir = scene_dir.resolve()
+    images_dir_name = validate_resplat_scene(scene_dir)
+    output_dir = (cfg.output_root / sanitize_scene_name(scene_name)).resolve()
+    if output_dir == scene_dir:
+        output_dir = (cfg.output_root / f"{sanitize_scene_name(scene_name)}_resplat").resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        sys.executable,
+        str(repo_root() / "scripts" / "infer_colmap.py"),
+        "--model_preset",
+        cfg.model_preset,
+        "--scene_path",
+        str(scene_dir.resolve()),
+        "--output_dir",
+        str(output_dir),
+        "--sparse_dir",
+        "sparse/0",
+        "--images_dir",
+        images_dir_name,
+        "--device",
+        cfg.device,
+        "--render_chunk_size",
+        str(cfg.render_chunk_size),
+    ]
+
+    if cfg.save_images:
+        command.append("--save_images")
+    else:
+        command.append("--no_save_images")
+    if cfg.save_ply:
+        command.append("--save_ply")
+    if cfg.save_video:
+        command.append("--save_video")
+    if cfg.save_depth:
+        command.append("--save_depth")
+    if cfg.no_eval:
+        command.append("--no_eval")
+
+    log("\nRunning ReSplat inference on prepared scene...")
+    log(f"Using image folder: {images_dir_name}")
+    run_command(command, log, cwd=repo_root())
+    log(f"\nReSplat results saved to: {output_dir}")
+    return output_dir
+
+
+def validate_resplat_scene(scene_dir: Path) -> str:
+    scene_dir = scene_dir.resolve()
+    if scene_dir.name == "_colmap_work":
+        raise RuntimeError(
+            "Selected _colmap_work, which is an internal scratch folder. "
+            f"Select the prepared scene folder instead: {scene_dir.parent}"
+        )
+
+    image_dir_candidates = ["images", "images_4"]
+    images_dir_name = next(
+        (
+            candidate
+            for candidate in image_dir_candidates
+            if (scene_dir / candidate).exists() and (scene_dir / candidate).is_dir()
+        ),
+        None,
+    )
+    sparse_dir = scene_dir / "sparse" / "0"
+
+    if not scene_dir.exists() or not scene_dir.is_dir():
+        raise RuntimeError(f"Prepared scene folder does not exist: {scene_dir}")
+    if images_dir_name is None:
+        raise RuntimeError(
+            "Prepared scene is missing an image folder. Expected either "
+            f"{scene_dir / 'images'} or {scene_dir / 'images_4'}"
+        )
+    if not sparse_dir.exists() or not sparse_dir.is_dir():
+        raise RuntimeError(f"Prepared scene is missing sparse/0/: {sparse_dir}")
+    if not (
+        (sparse_dir / "cameras.bin").exists()
+        or (sparse_dir / "cameras.txt").exists()
+    ):
+        raise RuntimeError(f"Prepared scene is missing cameras.bin/txt: {sparse_dir}")
+    if not (
+        (sparse_dir / "images.bin").exists()
+        or (sparse_dir / "images.txt").exists()
+    ):
+        raise RuntimeError(f"Prepared scene is missing images.bin/txt: {sparse_dir}")
+    return images_dir_name
 
 
 def remove_dir(path: Path) -> None:
@@ -287,7 +415,11 @@ def prepare_scene(cfg: PrepareConfig, log: Callable[[str], None] = print) -> Pat
 
 
 def default_output_root() -> Path:
-    return Path.cwd() / "datasets" / "colmap-custom"
+    return repo_root() / "datasets" / "colmap-custom"
+
+
+def default_results_root() -> Path:
+    return repo_root() / "results" / "colmap-custom"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -351,6 +483,70 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Fail instead of opening the GUI when --image_dir is omitted.",
     )
+    parser.add_argument(
+        "--run_resplat",
+        action="store_true",
+        help=(
+            "Run scripts/infer_colmap.py. If --resplat_scene_path is provided, "
+            "COLMAP preparation is skipped."
+        ),
+    )
+    parser.add_argument(
+        "--resplat_scene_path",
+        type=Path,
+        default=None,
+        help="Existing prepared scene folder to use for ReSplat without running COLMAP.",
+    )
+    parser.add_argument(
+        "--resplat_output_root",
+        type=Path,
+        default=default_results_root(),
+        help="Directory where ReSplat result folders will be created.",
+    )
+    parser.add_argument(
+        "--model_preset",
+        type=str,
+        default="dl3dv_8v_512x960",
+        choices=MODEL_PRESETS,
+        help="ReSplat model preset to use when --run_resplat is set.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0",
+        help="Device for ReSplat inference, for example cuda:0 or cpu.",
+    )
+    parser.add_argument(
+        "--render_chunk_size",
+        type=int,
+        default=10,
+        help="Number of target views rendered at once by ReSplat.",
+    )
+    parser.add_argument(
+        "--save_video",
+        action="store_true",
+        help="Save a smoothed ReSplat render video.",
+    )
+    parser.add_argument(
+        "--save_depth",
+        action="store_true",
+        help="Save ReSplat depth visualizations.",
+    )
+    parser.add_argument(
+        "--no_save_ply",
+        action="store_true",
+        help="Do not export gaussians.ply when running ReSplat.",
+    )
+    parser.add_argument(
+        "--no_save_resplat_images",
+        action="store_true",
+        help="Do not save rendered ReSplat images.",
+    )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Compute metrics against held-out target images.",
+    )
     return parser.parse_args(argv)
 
 
@@ -359,8 +555,8 @@ def launch_gui() -> None:
     from tkinter import filedialog, messagebox, scrolledtext
 
     root = tk.Tk()
-    root.title("Prepare ReSplat COLMAP Scene")
-    root.geometry("860x620")
+    root.title("COLMAP and ReSplat Processor")
+    root.geometry("920x760")
 
     image_dir_var = tk.StringVar()
     output_root_var = tk.StringVar(value=str(default_output_root()))
@@ -370,6 +566,17 @@ def launch_gui() -> None:
     single_camera_var = tk.BooleanVar(value=True)
     max_image_size_var = tk.StringVar(value="2000")
     overwrite_var = tk.BooleanVar(value=False)
+    step2_scene_path_var = tk.StringVar()
+    run_step2_after_step1_var = tk.BooleanVar(value=False)
+    resplat_output_root_var = tk.StringVar(value=str(default_results_root()))
+    model_preset_var = tk.StringVar(value="dl3dv_8v_512x960")
+    device_var = tk.StringVar(value="cuda:0")
+    render_chunk_size_var = tk.StringVar(value="10")
+    save_resplat_images_var = tk.BooleanVar(value=True)
+    save_ply_var = tk.BooleanVar(value=True)
+    save_video_var = tk.BooleanVar(value=False)
+    save_depth_var = tk.BooleanVar(value=False)
+    eval_var = tk.BooleanVar(value=False)
 
     def append_log_direct(text: str) -> None:
         log_box.configure(state="normal")
@@ -401,14 +608,73 @@ def launch_gui() -> None:
         if selected:
             colmap_var.set(selected)
 
-    def set_running(running: bool) -> None:
-        start_button.configure(state="disabled" if running else "normal")
+    def browse_resplat_output() -> None:
+        selected = filedialog.askdirectory(title="Select ReSplat output root folder")
+        if selected:
+            resplat_output_root_var.set(selected)
 
-    def start() -> None:
+    def browse_prepared_scene() -> None:
+        selected = filedialog.askdirectory(
+            title="Select prepared scene folder containing images/ and sparse/0/"
+        )
+        if selected:
+            selected_path = Path(selected)
+            if selected_path.name == "_colmap_work":
+                selected_path = selected_path.parent
+            step2_scene_path_var.set(str(selected_path))
+            if not scene_name_var.get().strip():
+                scene_name_var.set(sanitize_scene_name(selected_path.name))
+
+    def set_widget_tree_enabled(widget: tk.Widget, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        try:
+            widget.configure(state=state)
+        except tk.TclError:
+            pass
+        for child in widget.winfo_children():
+            set_widget_tree_enabled(child, enabled)
+
+    def set_running(active_step: str | None) -> None:
+        step1_enabled = active_step is None or active_step == "step1"
+        step2_enabled = active_step is None or active_step == "step2"
+        set_widget_tree_enabled(step1_frame, step1_enabled)
+        set_widget_tree_enabled(step2_frame, step2_enabled)
+        run_step1_button.configure(
+            state="disabled" if active_step is not None else "normal"
+        )
+        run_step2_button.configure(
+            state="disabled" if active_step is not None else "normal"
+        )
+
+    def build_step2_config() -> ReSplatRunConfig | None:
+        try:
+            render_chunk_size = int(render_chunk_size_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid value", "Render chunk size must be an integer."
+            )
+            return None
+
+        return ReSplatRunConfig(
+            enabled=True,
+            model_preset=model_preset_var.get(),
+            output_root=Path(resplat_output_root_var.get()),
+            device=device_var.get().strip() or "cuda:0",
+            save_images=save_resplat_images_var.get(),
+            save_ply=save_ply_var.get(),
+            save_video=save_video_var.get(),
+            save_depth=save_depth_var.get(),
+            no_eval=not eval_var.get(),
+            render_chunk_size=render_chunk_size,
+        )
+
+    def start_step1() -> None:
         try:
             max_image_size = int(max_image_size_var.get())
         except ValueError:
-            messagebox.showerror("Invalid value", "Max image size must be an integer.")
+            messagebox.showerror(
+                "Invalid value", "Max image size must be an integer."
+            )
             return
 
         scene_name = scene_name_var.get().strip()
@@ -426,13 +692,26 @@ def launch_gui() -> None:
             max_image_size=max_image_size,
             overwrite=overwrite_var.get(),
         )
+        resplat_cfg = build_step2_config() if run_step2_after_step1_var.get() else None
+        if run_step2_after_step1_var.get() and resplat_cfg is None:
+            return
 
-        set_running(True)
-        append_log("Starting COLMAP preparation...")
+        set_running("step1")
+        append_log("Starting Step 1: COLMAP preparation...")
 
         def worker() -> None:
             try:
                 scene_dir = prepare_scene(cfg, append_log)
+                root.after(0, lambda scene_dir=scene_dir: step2_scene_path_var.set(str(scene_dir)))
+                result_dir = None
+                if resplat_cfg is not None:
+                    root.after(0, lambda: set_running("step2"))
+                    result_dir = run_resplat_inference(
+                        scene_dir,
+                        cfg.scene_name,
+                        resplat_cfg,
+                        append_log,
+                    )
             except Exception as exc:
                 root.after(
                     0,
@@ -442,33 +721,82 @@ def launch_gui() -> None:
             else:
                 root.after(
                     0,
-                    lambda scene_dir=scene_dir: messagebox.showinfo(
-                        "Scene prepared", f"Ready for ReSplat:\n{scene_dir}"
+                    lambda scene_dir=scene_dir, result_dir=result_dir: messagebox.showinfo(
+                        "Done",
+                        (
+                            f"Step 1 complete. Ready for Step 2:\n{scene_dir}"
+                            if result_dir is None
+                            else f"Step 1 scene:\n{scene_dir}\n\nStep 2 results:\n{result_dir}"
+                        ),
                     ),
                 )
             finally:
-                root.after(0, lambda: set_running(False))
+                root.after(0, lambda: set_running(None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_step2() -> None:
+        resplat_cfg = build_step2_config()
+        if resplat_cfg is None:
+            return
+
+        scene_dir = Path(step2_scene_path_var.get())
+        scene_name = scene_name_var.get().strip() or sanitize_scene_name(scene_dir.name)
+        scene_name_var.set(scene_name)
+
+        set_running("step2")
+        append_log("Starting Step 2: ReSplat inference...")
+
+        def worker() -> None:
+            try:
+                result_dir = run_resplat_inference(
+                    scene_dir,
+                    scene_name,
+                    resplat_cfg,
+                    append_log,
+                )
+            except Exception as exc:
+                root.after(
+                    0,
+                    lambda exc=exc: messagebox.showerror("ReSplat failed", str(exc)),
+                )
+                root.after(0, lambda exc=exc: append_log_direct(f"\nERROR: {exc}"))
+            else:
+                root.after(
+                    0,
+                    lambda result_dir=result_dir: messagebox.showinfo(
+                        "Step 2 complete", f"ReSplat results:\n{result_dir}"
+                    ),
+                )
+            finally:
+                root.after(0, lambda: set_running(None))
 
         threading.Thread(target=worker, daemon=True).start()
 
     form = tk.Frame(root, padx=12, pady=12)
     form.pack(fill="x")
 
-    def add_row(row: int, label: str, widget: tk.Widget, browse: Callable[[], None] | None = None) -> None:
-        tk.Label(form, text=label, anchor="w", width=18).grid(row=row, column=0, sticky="w", pady=4)
+    def add_row(parent: tk.Widget, row: int, label: str, widget: tk.Widget, browse: Callable[[], None] | None = None) -> None:
+        tk.Label(parent, text=label, anchor="w", width=18).grid(row=row, column=0, sticky="w", pady=4)
         widget.grid(row=row, column=1, sticky="ew", pady=4)
         if browse:
-            tk.Button(form, text="Browse", command=browse).grid(row=row, column=2, padx=(8, 0), pady=4)
+            tk.Button(parent, text="Browse", command=browse).grid(row=row, column=2, padx=(8, 0), pady=4)
 
     form.columnconfigure(1, weight=1)
 
-    add_row(0, "Image folder", tk.Entry(form, textvariable=image_dir_var), browse_images)
-    add_row(1, "Output root", tk.Entry(form, textvariable=output_root_var), browse_output)
-    add_row(2, "Scene name", tk.Entry(form, textvariable=scene_name_var))
-    add_row(3, "COLMAP", tk.Entry(form, textvariable=colmap_var), browse_colmap)
+    step1_frame = tk.LabelFrame(
+        form, text="Step 1: COLMAP Scene Preparation", padx=8, pady=8
+    )
+    step1_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+    step1_frame.columnconfigure(1, weight=1)
+
+    add_row(step1_frame, 0, "Image folder", tk.Entry(step1_frame, textvariable=image_dir_var), browse_images)
+    add_row(step1_frame, 1, "Output root", tk.Entry(step1_frame, textvariable=output_root_var), browse_output)
+    add_row(step1_frame, 2, "Scene name", tk.Entry(step1_frame, textvariable=scene_name_var))
+    add_row(step1_frame, 3, "COLMAP", tk.Entry(step1_frame, textvariable=colmap_var), browse_colmap)
 
     camera_menu = tk.OptionMenu(
-        form,
+        step1_frame,
         camera_model_var,
         "SIMPLE_RADIAL",
         "RADIAL",
@@ -477,27 +805,94 @@ def launch_gui() -> None:
         "PINHOLE",
         "OPENCV_FISHEYE",
     )
-    add_row(4, "Raw camera model", camera_menu)
-    add_row(5, "Max image size", tk.Entry(form, textvariable=max_image_size_var))
+    add_row(step1_frame, 4, "Raw camera model", camera_menu)
+    add_row(step1_frame, 5, "Max image size", tk.Entry(step1_frame, textvariable=max_image_size_var))
 
-    options = tk.Frame(form)
+    options = tk.Frame(step1_frame)
     tk.Checkbutton(options, text="Shared camera calibration", variable=single_camera_var).pack(side="left")
     tk.Checkbutton(options, text="Overwrite existing scene", variable=overwrite_var).pack(
         side="left", padx=(18, 0)
     )
+    tk.Checkbutton(
+        options, text="Run Step 2 after Step 1", variable=run_step2_after_step1_var
+    ).pack(side="left", padx=(18, 0))
     options.grid(row=6, column=1, sticky="w", pady=4)
 
-    start_button = tk.Button(form, text="Prepare Scene", command=start)
-    start_button.grid(row=7, column=1, sticky="w", pady=(8, 4))
+    run_step1_button = tk.Button(
+        step1_frame, text="Run Step 1: COLMAP", command=start_step1
+    )
+    run_step1_button.grid(row=7, column=1, sticky="w", pady=(8, 4))
+
+    step2_frame = tk.LabelFrame(
+        form, text="Step 2: ReSplat Inference", padx=8, pady=8
+    )
+    step2_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+    step2_frame.columnconfigure(1, weight=1)
+
+    add_row(
+        step2_frame,
+        0,
+        "Prepared scene",
+        tk.Entry(step2_frame, textvariable=step2_scene_path_var),
+        browse_prepared_scene,
+    )
+    add_row(
+        step2_frame,
+        1,
+        "Output root",
+        tk.Entry(step2_frame, textvariable=resplat_output_root_var),
+        browse_resplat_output,
+    )
+    tk.Label(step2_frame, text="Model preset", anchor="w", width=18).grid(
+        row=2, column=0, sticky="w", pady=3
+    )
+    tk.OptionMenu(step2_frame, model_preset_var, *MODEL_PRESETS).grid(
+        row=2, column=1, sticky="w", pady=3
+    )
+    tk.Label(step2_frame, text="Device", anchor="w", width=18).grid(
+        row=3, column=0, sticky="w", pady=3
+    )
+    tk.Entry(step2_frame, textvariable=device_var).grid(
+        row=3, column=1, sticky="ew", pady=3
+    )
+    tk.Label(step2_frame, text="Render chunk size", anchor="w", width=18).grid(
+        row=4, column=0, sticky="w", pady=3
+    )
+    tk.Entry(step2_frame, textvariable=render_chunk_size_var).grid(
+        row=4, column=1, sticky="ew", pady=3
+    )
+
+    resplat_options = tk.Frame(step2_frame)
+    tk.Checkbutton(
+        resplat_options, text="Rendered images", variable=save_resplat_images_var
+    ).pack(side="left")
+    tk.Checkbutton(resplat_options, text="PLY", variable=save_ply_var).pack(
+        side="left", padx=(14, 0)
+    )
+    tk.Checkbutton(resplat_options, text="Video", variable=save_video_var).pack(
+        side="left", padx=(14, 0)
+    )
+    tk.Checkbutton(resplat_options, text="Depth", variable=save_depth_var).pack(
+        side="left", padx=(14, 0)
+    )
+    tk.Checkbutton(resplat_options, text="Metrics", variable=eval_var).pack(
+        side="left", padx=(14, 0)
+    )
+    resplat_options.grid(row=5, column=1, sticky="w", pady=3)
+
+    run_step2_button = tk.Button(
+        step2_frame, text="Run Step 2: ReSplat", command=start_step2
+    )
+    run_step2_button.grid(row=6, column=1, sticky="w", pady=(8, 4))
 
     log_box = scrolledtext.ScrolledText(root, state="disabled", height=22)
     log_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
     append_log(
-        "Select a raw image folder, choose an output root, then click Prepare Scene."
+        "Step 1 creates a ReSplat-compatible COLMAP scene from raw images."
     )
     append_log(
-        "The final scene will contain images/ and sparse/0/ for scripts/infer_colmap.py."
+        "Step 2 can run on any existing prepared scene folder with images/ and sparse/0/."
     )
 
     root.mainloop()
@@ -507,8 +902,29 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
 
     if args.image_dir is None:
+        if args.run_resplat and args.resplat_scene_path is not None:
+            scene_dir = args.resplat_scene_path.resolve()
+            validate_resplat_scene(scene_dir)
+            scene_name = args.scene_name or sanitize_scene_name(scene_dir.name)
+            resplat_cfg = ReSplatRunConfig(
+                enabled=True,
+                model_preset=args.model_preset,
+                output_root=args.resplat_output_root,
+                device=args.device,
+                save_images=not args.no_save_resplat_images,
+                save_ply=not args.no_save_ply,
+                save_video=args.save_video,
+                save_depth=args.save_depth,
+                no_eval=not args.eval,
+                render_chunk_size=args.render_chunk_size,
+            )
+            run_resplat_inference(scene_dir, scene_name, resplat_cfg)
+            return 0
         if args.no_gui:
-            raise SystemExit("--image_dir is required when --no_gui is set")
+            raise SystemExit(
+                "--image_dir is required unless --run_resplat and "
+                "--resplat_scene_path are set"
+            )
         launch_gui()
         return 0
 
@@ -523,7 +939,21 @@ def main(argv: list[str] | None = None) -> int:
         max_image_size=args.max_image_size,
         overwrite=args.overwrite,
     )
-    prepare_scene(cfg)
+    scene_dir = prepare_scene(cfg)
+    if args.run_resplat:
+        resplat_cfg = ReSplatRunConfig(
+            enabled=True,
+            model_preset=args.model_preset,
+            output_root=args.resplat_output_root,
+            device=args.device,
+            save_images=not args.no_save_resplat_images,
+            save_ply=not args.no_save_ply,
+            save_video=args.save_video,
+            save_depth=args.save_depth,
+            no_eval=not args.eval,
+            render_chunk_size=args.render_chunk_size,
+        )
+        run_resplat_inference(scene_dir, cfg.scene_name, resplat_cfg)
     return 0
 
 

@@ -142,6 +142,13 @@ You can prepare this layout from a folder of raw images with the local folder-pi
 python scripts/prepare_colmap_scene.py
 ```
 
+The GUI is split into two independent sections:
+
+- **Step 1: COLMAP Scene Preparation** creates an undistorted COLMAP scene from raw images.
+- **Step 2: ReSplat Inference** runs [scripts/infer_colmap.py](scripts/infer_colmap.py) on an existing prepared scene folder. You can run Step 2 without running Step 1 if you already have a folder containing `images/` or `images_4/`, plus `sparse/0/`.
+
+When either step is running, the other section is disabled in the GUI. Step 1 can optionally run Step 2 automatically after the generated scene is ready.
+
 The same tool can run without the GUI:
 
 ```bash
@@ -151,7 +158,29 @@ python scripts/prepare_colmap_scene.py \
     --scene_name my_scene
 ```
 
-The tool runs COLMAP feature extraction, matching, mapping, and image undistortion, then copies the undistorted images and sparse camera model into the `images/` and `sparse/0/` folders required by [scripts/infer_colmap.py](scripts/infer_colmap.py).
+To prepare the scene and immediately run ReSplat from the command line:
+
+```bash
+python scripts/prepare_colmap_scene.py \
+    --image_dir /path/to/raw/images \
+    --output_root datasets/colmap-custom \
+    --scene_name my_scene \
+    --run_resplat \
+    --model_preset dl3dv_8v_512x960 \
+    --resplat_output_root results/colmap-custom
+```
+
+To run ReSplat on an existing prepared scene without running COLMAP:
+
+```bash
+python scripts/prepare_colmap_scene.py \
+    --run_resplat \
+    --resplat_scene_path datasets/colmap-custom/my_scene \
+    --model_preset dl3dv_8v_512x960 \
+    --resplat_output_root results/colmap-custom
+```
+
+Step 1 runs COLMAP feature extraction, matching, mapping, and image undistortion, then copies the undistorted images and sparse camera model into the `images/` and `sparse/0/` folders required by [scripts/infer_colmap.py](scripts/infer_colmap.py).
 
 
 ## Evaluation
