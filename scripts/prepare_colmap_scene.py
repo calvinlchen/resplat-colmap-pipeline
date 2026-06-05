@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import re
 import shutil
 import signal
@@ -142,6 +143,7 @@ class PrepareConfig:
     camera_model: str
     single_camera: bool
     max_image_size: int
+    random_image_count: int | None
     overwrite: bool
 
 
@@ -218,11 +220,41 @@ def sanitize_scene_name(name: str) -> str:
 
 
 def count_images(image_dir: Path) -> int:
-    return sum(
-        1
+    return len(list_image_paths(image_dir))
+
+
+def list_image_paths(image_dir: Path) -> list[Path]:
+    return sorted(
+        path
         for path in image_dir.iterdir()
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
+
+
+def prepare_colmap_image_dir(
+    image_paths: list[Path],
+    image_dir: Path,
+    work_dir: Path,
+    requested_count: int | None,
+    log: Callable[[str], None],
+) -> Path:
+    image_count = len(image_paths)
+    if requested_count is None or requested_count >= image_count:
+        log(f"Using all {image_count} supported image(s).")
+        return image_dir
+
+    if requested_count < 3:
+        raise RuntimeError("Random image count must be at least 3 for COLMAP.")
+
+    selected_paths = sorted(random.sample(image_paths, requested_count))
+    selected_dir = work_dir / "selected_images"
+    selected_dir.mkdir(parents=True, exist_ok=True)
+    for source in selected_paths:
+        shutil.copy2(source, selected_dir / source.name)
+
+    log(f"Randomly selected {requested_count} of {image_count} supported image(s).")
+    log(f"Selected image folder: {selected_dir}")
+    return selected_dir
 
 
 def ensure_colmap(colmap: str) -> str:
@@ -553,10 +585,16 @@ def prepare_scene(
     if not cfg.image_dir.exists() or not cfg.image_dir.is_dir():
         raise RuntimeError(f"Image folder does not exist: {cfg.image_dir}")
 
-    image_count = count_images(cfg.image_dir)
+    image_paths = list_image_paths(cfg.image_dir)
+    image_count = len(image_paths)
     if image_count < 3:
         raise RuntimeError(
             f"Found {image_count} supported image(s). COLMAP needs at least 3 images."
+        )
+    if cfg.random_image_count is not None and cfg.random_image_count > image_count:
+        raise RuntimeError(
+            f"Requested {cfg.random_image_count} random image(s), but only "
+            f"{image_count} supported image(s) were found."
         )
 
     scene_dir = cfg.output_root / cfg.scene_name
@@ -584,9 +622,18 @@ def prepare_scene(
     remove_dir(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     sparse_raw_dir.mkdir(parents=True, exist_ok=True)
+    colmap_image_dir = prepare_colmap_image_dir(
+        image_paths,
+        cfg.image_dir,
+        work_dir,
+        cfg.random_image_count,
+        log,
+    )
 
     log(f"Input images: {cfg.image_dir}")
     log(f"Supported images found: {image_count}")
+    if colmap_image_dir != cfg.image_dir:
+        log(f"COLMAP input images: {colmap_image_dir}")
     log(f"Output scene: {scene_dir}")
     log(f"COLMAP: {cfg.colmap}")
 
@@ -596,7 +643,7 @@ def prepare_scene(
         "--database_path",
         str(database_path),
         "--image_path",
-        str(cfg.image_dir),
+        str(colmap_image_dir),
         "--ImageReader.camera_model",
         cfg.camera_model,
         "--ImageReader.single_camera",
@@ -622,7 +669,7 @@ def prepare_scene(
             "--database_path",
             str(database_path),
             "--image_path",
-            str(cfg.image_dir),
+            str(colmap_image_dir),
             "--output_path",
             str(sparse_raw_dir),
         ],
@@ -639,7 +686,7 @@ def prepare_scene(
         cfg.colmap,
         "image_undistorter",
         "--image_path",
-        str(cfg.image_dir),
+        str(colmap_image_dir),
         "--input_path",
         str(sparse_model),
         "--output_path",
@@ -730,6 +777,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=2000,
         help="Maximum undistorted image size. Use 0 to keep COLMAP's default.",
+    )
+    parser.add_argument(
+        "--random_image_count",
+        type=int,
+        default=None,
+        help=(
+            "Randomly select this many images from --image_dir for COLMAP. "
+            "Defaults to all supported images."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -1051,6 +1107,8 @@ def launch_gui() -> None:
     camera_model_var = tk.StringVar(value="OPENCV")
     single_camera_var = tk.BooleanVar(value=True)
     max_image_size_var = tk.StringVar(value="2000")
+    random_image_count_var = tk.StringVar()
+    image_count_var = tk.StringVar(value="Supported images: select a folder")
     overwrite_var = tk.BooleanVar(value=False)
     step2_scene_path_var = tk.StringVar()
     run_step2_after_step1_var = tk.BooleanVar(value=False)
@@ -1075,10 +1133,22 @@ def launch_gui() -> None:
     def append_log(text: str) -> None:
         root.after(0, append_log_direct, text)
 
+    def update_image_count(selected: str) -> None:
+        selected_path = Path(selected)
+        if not selected_path.exists() or not selected_path.is_dir():
+            image_count_var.set("Supported images: folder not found")
+            random_image_count_var.set("")
+            return
+
+        image_count = count_images(selected_path)
+        image_count_var.set(f"Supported images: {image_count}")
+        random_image_count_var.set(str(image_count) if image_count else "")
+
     def browse_images() -> None:
         selected = filedialog.askdirectory(title="Select folder containing images")
         if selected:
             image_dir_var.set(selected)
+            update_image_count(selected)
             if not scene_name_var.get().strip():
                 scene_name_var.set(sanitize_scene_name(Path(selected).name))
         root.after_idle(lambda: set_running(None))
@@ -1174,6 +1244,36 @@ def launch_gui() -> None:
             render_chunk_size=render_chunk_size,
         )
 
+    def parse_random_image_count() -> tuple[bool, int | None]:
+        raw_value = random_image_count_var.get().strip()
+        if not raw_value:
+            return True, None
+        try:
+            requested_count = int(raw_value)
+        except ValueError:
+            messagebox.showerror(
+                "Invalid value", "Photos to use must be a whole number."
+            )
+            return False, None
+        if requested_count < 3:
+            messagebox.showerror(
+                "Invalid value", "Photos to use must be at least 3 for COLMAP."
+            )
+            return False, None
+
+        image_dir = Path(image_dir_var.get())
+        if image_dir.exists() and image_dir.is_dir():
+            image_count = count_images(image_dir)
+            if requested_count > image_count:
+                messagebox.showerror(
+                    "Invalid value",
+                    f"Photos to use cannot exceed the {image_count} supported image(s) in the folder.",
+                )
+                return False, None
+            if requested_count == image_count:
+                return True, None
+        return True, requested_count
+
     def start_step1() -> None:
         nonlocal active_controller
         try:
@@ -1182,6 +1282,9 @@ def launch_gui() -> None:
             messagebox.showerror(
                 "Invalid value", "Max image size must be an integer."
             )
+            return
+        random_image_count_valid, random_image_count = parse_random_image_count()
+        if not random_image_count_valid:
             return
 
         scene_name = scene_name_var.get().strip()
@@ -1197,6 +1300,7 @@ def launch_gui() -> None:
             camera_model=camera_model_var.get(),
             single_camera=single_camera_var.get(),
             max_image_size=max_image_size,
+            random_image_count=random_image_count,
             overwrite=overwrite_var.get(),
         )
         resplat_cfg = build_step2_config() if run_step2_after_step1_var.get() else None
@@ -1349,6 +1453,10 @@ def launch_gui() -> None:
     )
     add_row(step1_frame, 4, "Raw camera model", camera_menu)
     add_row(step1_frame, 5, "Max image size", tk.Entry(step1_frame, textvariable=max_image_size_var))
+    add_row(step1_frame, 6, "Photos to use", tk.Entry(step1_frame, textvariable=random_image_count_var))
+    tk.Label(step1_frame, textvariable=image_count_var, anchor="w").grid(
+        row=6, column=2, sticky="w", padx=(8, 0), pady=4
+    )
 
     options = tk.Frame(step1_frame)
     register_interactive(
@@ -1362,12 +1470,12 @@ def launch_gui() -> None:
     register_interactive(tk.Checkbutton(
         options, text="Run Step 2 after Step 1", variable=run_step2_after_step1_var
     )).pack(side="left", padx=(18, 0))
-    options.grid(row=6, column=1, sticky="w", pady=4)
+    options.grid(row=7, column=1, sticky="w", pady=4)
 
     run_step1_button = tk.Button(
         step1_frame, text="Run Step 1: COLMAP", command=start_step1
     )
-    run_step1_button.grid(row=7, column=1, sticky="w", pady=(8, 4))
+    run_step1_button.grid(row=8, column=1, sticky="w", pady=(8, 4))
 
     step2_frame = tk.LabelFrame(
         form, text="Step 2: ReSplat Inference", padx=8, pady=8
@@ -1512,6 +1620,7 @@ def main(argv: list[str] | None = None) -> int:
         camera_model=args.camera_model,
         single_camera=not args.per_image_camera,
         max_image_size=args.max_image_size,
+        random_image_count=args.random_image_count,
         overwrite=args.overwrite,
     )
     scene_dir = prepare_scene(cfg)
